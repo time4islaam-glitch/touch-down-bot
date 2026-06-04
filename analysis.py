@@ -164,7 +164,7 @@ def fetch_and_analyse(ticker: str) -> AnalysisResult:
             interval=CANDLE_INTERVAL,
             progress=False,
             auto_adjust=True,
-            multi_level_column=False,
+            multi_level_index=False,
         )
 
         if raw is None or raw.empty:
@@ -297,7 +297,7 @@ def validate_ticker(ticker: str) -> bool:
             interval="1d",
             progress=False,
             auto_adjust=True,
-            multi_level_column=False,
+            multi_level_index=False,
         )
         return data is not None and not data.empty
     except Exception as exc:
