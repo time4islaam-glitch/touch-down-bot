@@ -16,8 +16,8 @@ from datetime import datetime, timedelta, timezone
 from telegram import Bot
 from telegram.constants import ParseMode
 
-from modules import watchlist as wl_store
-from modules.analysis import fetch_and_analyse, AnalysisResult, _score_label
+import watchlist as wl_store
+from analysis import fetch_and_analyse, AnalysisResult, _score_label
 
 logger = logging.getLogger(__name__)
 

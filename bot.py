@@ -11,14 +11,14 @@ import os
 
 from telegram.ext import Application, CommandHandler
 
-from modules.commands import (
+from commands import (
     cmd_start,
     cmd_add,
     cmd_remove,
     cmd_watchlist,
 )
-from modules.scanner import run_scanner_loop
-from modules.trading212 import Trading212Client
+from scanner import run_scanner_loop
+from trading212 import Trading212Client
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(

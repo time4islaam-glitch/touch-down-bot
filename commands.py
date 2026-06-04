@@ -13,8 +13,8 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from modules import watchlist as wl_store
-from modules.analysis import validate_ticker
+import watchlist as wl_store
+from analysis import validate_ticker
 
 logger = logging.getLogger(__name__)
 
