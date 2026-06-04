@@ -1,19 +1,17 @@
 # ── Telegram ──────────────────────────────────────────────────────────────────
-python-telegram-bot==21.5       # v20+ async API; pin minor to avoid breaking changes
+python-telegram-bot[job-queue]>=20.0,<21.0
 
 # ── Market data ───────────────────────────────────────────────────────────────
-yfinance==0.2.43                # OHLCV download via Yahoo Finance
-pandas==2.2.2                   # DataFrame backbone for indicator calc
-numpy==1.26.4                   # Required by pandas; pin for stability
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
 
 # ── HTTP client (Trading 212 integration) ────────────────────────────────────
-requests==2.32.3                # Synchronous HTTP for T212 REST calls
-urllib3==2.2.2                  # Requests dependency; pin to avoid ssl issues
+requests>=2.31.0
 
 # ── Async support ─────────────────────────────────────────────────────────────
-httpx==0.27.0                   # Used internally by python-telegram-bot v21
-anyio==4.4.0                    # Async compatibility layer
+httpx>=0.24.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-python-dateutil==2.9.0          # Robust datetime parsing for alert timestamps
-pytz==2024.1                    # Timezone support
+python-dateutil>=2.8.0
+pytz>=2023.3
