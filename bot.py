@@ -14,6 +14,7 @@ from telegram.ext import Application, CommandHandler
 from commands import (
     cmd_start,
     cmd_add,
+    cmd_addmany,
     cmd_remove,
     cmd_watchlist,
 )
@@ -83,6 +84,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_start))
     app.add_handler(CommandHandler("add",       cmd_add))
+    app.add_handler(CommandHandler("addmany",   cmd_addmany))
     app.add_handler(CommandHandler("remove",    cmd_remove))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
 

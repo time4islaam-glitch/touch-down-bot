@@ -37,6 +37,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📋 *Available Commands*\n\n"
         "• `/add <TICKER>` — Add a stock to the watchlist\n"
         "  _e.g._ `/add AAPL`\n\n"
+        "• `/addmany <TICKER> ...` — Add multiple stocks at once\n"
+        "  _e.g._ `/addmany AAPL TSLA NVDA MSFT`\n\n"
         "• `/remove <TICKER>` — Remove a stock from the watchlist\n"
         "  _e.g._ `/remove AAPL`\n\n"
         "• `/watchlist` — Show all tracked tickers & status\n\n"
@@ -110,6 +112,80 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.MARKDOWN,
     )
     logger.info("Ticker %s added by user %s", ticker, update.effective_user.id)
+
+
+# ── /addmany ──────────────────────────────────────────────────────────────────
+
+async def cmd_addmany(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Add multiple tickers to the watchlist in one command.
+    Usage: /addmany AAPL TSLA NVDA MSFT
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Please provide at least one ticker symbol.\n"
+            "_Example:_ `/addmany AAPL TSLA NVDA`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    import asyncio
+
+    tickers = [t.upper().strip() for t in context.args]
+
+    # Basic format validation
+    invalid_format = [t for t in tickers if not t.isalpha() or len(t) > 10]
+    if invalid_format:
+        await update.message.reply_text(
+            "⚠️ Invalid ticker(s): " + ", ".join(f"`{t}`" for t in invalid_format),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    watchlist = wl_store.load()
+    already = [t for t in tickers if t in watchlist]
+    to_add = [t for t in tickers if t not in watchlist]
+
+    if not to_add:
+        await update.message.reply_text(
+            "ℹ️ All provided tickers are already on the watchlist.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔍 Validating {len(to_add)} ticker(s)… please wait.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    loop = asyncio.get_running_loop()
+    results = await asyncio.gather(
+        *[loop.run_in_executor(None, validate_ticker, t) for t in to_add]
+    )
+
+    added, failed = [], []
+    for ticker, valid in zip(to_add, results):
+        if valid:
+            wl_store.add_ticker(watchlist, ticker)
+            added.append(ticker)
+        else:
+            failed.append(ticker)
+
+    lines = []
+    if added:
+        lines.append("✅ *Added:* " + ", ".join(f"`{t}`" for t in added))
+    if already:
+        lines.append("ℹ️ *Already tracked:* " + ", ".join(f"`{t}`" for t in already))
+    if failed:
+        lines.append("❌ *Not found:* " + ", ".join(f"`{t}`" for t in failed))
+
+    lines.append(f"\n_Watchlist now has {len(wl_store.load())} ticker(s)._")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    logger.info(
+        "addmany by user %s — added: %s, failed: %s",
+        update.effective_user.id, added, failed,
+    )
 
 
 # ── /remove ───────────────────────────────────────────────────────────────────
