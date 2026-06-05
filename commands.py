@@ -15,6 +15,7 @@ from telegram.ext import ContextTypes
 
 import watchlist as wl_store
 from analysis import validate_ticker
+from regime import get_regime_context, TARGET_REGIMES, REGIME_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else "_none yet_"
     )
 
+    regime_ctx = get_regime_context()
+    regime_status = (
+        f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 *Current Market Regime*\n"
+        f"`{regime_ctx.get('label', 'Unknown')}`  "
+        f"{'✅ Active — signals enabled' if regime_ctx.get('is_target') else '⛔ Inactive — signals suppressed'}\n"
+        f"_SPY: ${regime_ctx.get('spy_close', 0):.2f}_"
+    ) if regime_ctx else ""
+
     text = (
         "👋 *Welcome to your Trading Alert Bot!*\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -45,11 +55,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/help` — Show this message\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *Alert Logic*\n"
-        "An alert fires when a ticker is in an *uptrend* (price > 200 SMA) "
-        "*and* the current price is within 0.5 % of the 200 SMA, 62 EMA, "
-        "or 79 EMA. Alerts respect a 4-hour cooldown per ticker.\n\n"
+        "An alert fires when all 8 entry checks pass: uptrend, SMA200 slope, "
+        "MA proximity (low within 1.5% of 62 EMA / 79 EMA / 200 SMA), "
+        "bullish candle, volume, EMA slope, clean structure, and not overextended. "
+        "Alerts respect a 4-hour cooldown per ticker.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *Currently tracking {ticker_count} ticker(s):*\n{tickers_str}"
+        f"{regime_status}"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 

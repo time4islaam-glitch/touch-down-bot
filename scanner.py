@@ -18,6 +18,7 @@ from telegram.constants import ParseMode
 
 import watchlist as wl_store
 from analysis import fetch_and_analyse, AnalysisResult, _score_label
+from regime import is_target_regime, get_regime_context, TARGET_REGIMES
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,9 @@ MARKET_CLOSE_UTC      = int(os.environ.get("MARKET_CLOSE_UTC",       21))  # 17:
 
 # Minimum score to send a "watching" partial alert (won't fire a full alert)
 PARTIAL_ALERT_MIN_SCORE = int(os.environ.get("PARTIAL_ALERT_MIN_SCORE", 5))
+
+# Regime filter — when True, only fire alerts in TARGET_REGIMES (BULL_HIGH_VOL, CORRECTION)
+REGIME_FILTER_ENABLED = os.environ.get("REGIME_FILTER", "true").lower() == "true"
 
 
 # ── Message builders ───────────────────────────────────────────────────────────
@@ -58,31 +62,42 @@ def _build_full_alert(result: AnalysisResult) -> str:
     score_label = _score_label(c.score)
 
     checks_block = "\n".join([
-        _check_row("Uptrend  (Price > 200 SMA)",    c.uptrend),
-        _check_row("MA Proximity  (≤ 0.5%)",         c.ma_proximity,   ma_hits),
+        _check_row("Uptrend  (Price > 200 SMA)",       c.uptrend),
+        _check_row("SMA200 Slope  (rising 20 bars)",   c.sma200_slope),
+        _check_row("MA Proximity  (low ≤ 1.5%)",       c.ma_proximity,   ma_hits),
         _check_row("Bullish Candle  (green + upper ½)", c.bullish_candle),
-        _check_row("Volume  (≥ 20-day avg)",         c.volume_ok,      vol_ratio),
-        _check_row("EMA Slope  (62 EMA rising)",     c.ema_slope_ok),
-        _check_row("Clean Structure  (5-bar hold)",  c.clean_structure),
-        _check_row("Not Overextended  (≤ 10% > SMA)", c.not_overextended),
+        _check_row("Volume  (≥ 20-day avg)",            c.volume_ok,      vol_ratio),
+        _check_row("EMA Slope  (62 EMA rising)",        c.ema_slope_ok),
+        _check_row("Clean Structure  (5-bar hold)",     c.clean_structure),
+        _check_row("Not Overextended  (≤ 10% > SMA)",  c.not_overextended),
     ])
+
+    reg = get_regime_context()
+    regime_line = (
+        f"\n🌐 *Market Regime:*  `{reg.get('label', '—')}`  "
+        f"_(SPY SMA50: ${reg.get('spy_sma50', 0):.2f} "
+        f"/ SMA200: ${reg.get('spy_sma200', 0):.2f})_\n"
+    ) if reg else ""
 
     return (
         f"🚨 *TRADE ALERT — {result.ticker}* 🚨\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 *Entry Price:*  `${result.current_price:.2f}`\n"
-        f"📊 *Signal Quality:*  {score_label}  `{c.score}/7`\n\n"
+        f"📊 *Signal Quality:*  {score_label}  `{c.score}/8`\n\n"
         f"📐 *Moving Averages*\n"
         f"  • 200 SMA → `${result.sma_200:.2f}`\n"
         f"  • 62  EMA → `${result.ema_62:.2f}`\n"
         f"  • 79  EMA → `${result.ema_79:.2f}`\n\n"
-        f"🎯 *MA Touch:*  `{ma_hits}`\n\n"
+        f"🎯 *MA Touch:*  `{ma_hits}`\n"
+        f"{regime_line}"
         f"🛡️ *Stop Loss Levels*\n"
-        f"  • Primary   → `${s.primary_stop:.2f}`  _(close below 79 EMA)_\n"
-        f"  • Hard stop → `${s.hard_stop:.2f}`  _(−0.5% buffer)_\n"
-        f"  • Breakdown → `${s.catastrophic_stop:.2f}`  _(200 SMA breach)_\n"
-        f"  • Risk from entry: `{s.risk_pct:.2f}%`\n\n"
-        f"✅ *Entry Checks  [{c.score}/7]*\n"
+        f"  • Hard stop  → `${s.hard_stop:.2f}`  _(79 EMA − 1× ATR)_\n"
+        f"  • Primary    → `${s.primary_stop:.2f}`  _(close below 79 EMA)_\n"
+        f"  • Breakdown  → `${s.catastrophic_stop:.2f}`  _(200 SMA breach)_\n"
+        f"  • 🎯 Target  → `${s.partial_target:.2f}`  _(2R partial exit)_\n"
+        f"  • Trail at   → `${s.trail_activation:.2f}`  _(+3% activation)_\n"
+        f"  • ATR(14):  `${s.atr14:.2f}`  |  Risk: `{s.risk_pct:.2f}%`\n\n"
+        f"✅ *Entry Checks  [{c.score}/8]*\n"
         f"{checks_block}\n\n"
         f"🕐 `{result.timestamp.strftime('%Y-%m-%d %H:%M UTC')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -100,13 +115,14 @@ def _build_watch_alert(result: AnalysisResult) -> str:
     score_label = _score_label(c.score)
 
     failing = []
+    if not c.uptrend:          failing.append("uptrend (price > 200 SMA)")
+    if not c.sma200_slope:     failing.append("SMA200 slope rising (20-bar)")
+    if not c.ma_proximity:     failing.append("MA proximity touch (low ≤ 1.5%)")
     if not c.bullish_candle:   failing.append("bullish candle confirmation")
     if not c.volume_ok:        failing.append("above-average volume")
     if not c.ema_slope_ok:     failing.append("62 EMA slope rising")
     if not c.clean_structure:  failing.append("clean 5-bar EMA structure")
     if not c.not_overextended: failing.append("price not overextended")
-    if not c.ma_proximity:     failing.append("MA proximity touch")
-    if not c.uptrend:          failing.append("uptrend (price > 200 SMA)")
 
     missing_str = "\n".join(f"  ⏳ {f}" for f in failing)
 
@@ -114,7 +130,7 @@ def _build_watch_alert(result: AnalysisResult) -> str:
         f"👀 *WATCHING — {result.ticker}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 *Current Price:*  `${result.current_price:.2f}`\n"
-        f"📊 *Signal Quality:*  {score_label}  `{c.score}/7`\n"
+        f"📊 *Signal Quality:*  {score_label}  `{c.score}/8`\n"
         f"🎯 *MA Touch:*  `{ma_hits}`\n\n"
         f"⏳ *Still needed for full alert:*\n{missing_str}\n\n"
         f"📐 *Levels*\n"
@@ -185,6 +201,15 @@ async def _run_single_scan(bot: Bot, chat_id: str) -> None:
 
     logger.info("Starting scan of %d ticker(s)…", len(watchlist))
 
+    # Log regime once per scan cycle
+    reg_ctx = get_regime_context()
+    if reg_ctx:
+        logger.info(
+            "Scan cycle — regime: %s | SPY close: %.2f | target: %s",
+            reg_ctx.get('label'), reg_ctx.get('spy_close'),
+            reg_ctx.get('is_target'),
+        )
+
     for ticker, state in list(watchlist.items()):
         await _process_ticker(bot, chat_id, watchlist, ticker, state)
         # Yield between tickers to keep the event loop healthy
@@ -218,7 +243,17 @@ async def _process_ticker(
 
     cooldown_clear = _cooldown_expired(state.get("last_alert_ts"))
 
-    # ── Path A: All 7 checks pass → full TRADE ALERT ──────────────────────────
+    # ── v3 Regime gate ────────────────────────────────────────────────────
+    if REGIME_FILTER_ENABLED:
+        if not is_target_regime():
+            current_regime = get_regime_context().get('label', 'Unknown')
+            logger.info(
+                "Signal suppressed for %s — regime is %s (not a target regime).",
+                ticker, current_regime,
+            )
+            return
+
+    # ── Path A: All 8 checks pass → full TRADE ALERT ──────────────────────────
     if result.checks.all_pass and cooldown_clear:
         await _send(bot, chat_id, _build_full_alert(result))
         wl_store.update_ticker_state(
@@ -226,7 +261,7 @@ async def _process_ticker(
             last_alert_ts = result.timestamp.isoformat(),
         )
         logger.info(
-            "FULL ALERT sent for %s  score=7/7  MAs=%s",
+            "FULL ALERT sent for %s  score=8/8  MAs=%s",
             ticker, result.triggered_mas,
         )
 
@@ -246,13 +281,13 @@ async def _process_ticker(
         # Use a shorter cooldown for watch alerts (half of full cooldown)
         # by NOT storing last_alert_ts — just log it
         logger.info(
-            "WATCH ALERT sent for %s  score=%d/7  missing checks logged.",
+            "WATCH ALERT sent for %s  score=%d/8  missing checks logged.",
             ticker, result.checks.score,
         )
 
     else:
         logger.info(
-            "%s — no alert. score=%d/7  uptrend=%s  proximity=%s",
+            "%s — no alert. score=%d/8  uptrend=%s  proximity=%s",
             ticker, result.checks.score,
             result.checks.uptrend, result.checks.ma_proximity,
         )
