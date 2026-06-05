@@ -17,6 +17,8 @@ from commands import (
     cmd_addmany,
     cmd_remove,
     cmd_watchlist,
+    cmd_refresh,
+    cmd_universe,
 )
 from scanner import run_scanner_loop
 from trading212 import Trading212Client
@@ -87,6 +89,8 @@ def main() -> None:
     app.add_handler(CommandHandler("addmany",   cmd_addmany))
     app.add_handler(CommandHandler("remove",    cmd_remove))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    app.add_handler(CommandHandler("refresh",  cmd_refresh))
+    app.add_handler(CommandHandler("universe", cmd_universe))
 
     logger.info("Bot starting — polling for updates…")
     # run_polling blocks forever; drop_pending_updates avoids replaying old cmds

@@ -7,6 +7,7 @@ reflect the latest state even after a bot restart.
 """
 
 import logging
+import os
 from datetime import datetime
 
 from telegram import Update
@@ -281,3 +282,81 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "\n".join(lines),
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ── /refresh ──────────────────────────────────────────────────────────────────
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /refresh — manually trigger a universe refresh.
+    Admin-only: only responds if the caller's Telegram user ID matches
+    the ADMIN_USER_ID env var.
+    """
+    admin_id = int(os.environ.get("ADMIN_USER_ID", "0"))
+    caller_id = update.effective_user.id if update.effective_user else 0
+
+    if admin_id == 0 or caller_id != admin_id:
+        await update.message.reply_text(
+            "⛔ This command is restricted to the bot administrator.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text(
+        "🔄 Starting universe refresh… this may take a few minutes.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    import asyncio
+    from universe import refresh_universe
+
+    try:
+        count = await refresh_universe(
+            update.get_bot(),
+            str(update.effective_chat.id),
+        )
+        await update.message.reply_text(
+            f"✅ Universe refresh complete — `{count}` candidates saved.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        logger.exception("cmd_refresh error: %s", exc)
+        await update.message.reply_text(
+            f"❌ Universe refresh failed: `{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ── /universe ─────────────────────────────────────────────────────────────────
+
+async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /universe — show current universe mode status, candidate count, and last refresh time.
+    """
+    from universe import load_candidates, get_last_refresh_time, ENABLED_EXCHANGES
+    from scanner import UNIVERSE_MODE
+
+    candidates   = load_candidates()
+    last_refresh = get_last_refresh_time()
+    mode_str     = "✅ *ON*" if UNIVERSE_MODE else "⛔ *OFF*"
+    exchanges    = ", ".join(ENABLED_EXCHANGES)
+
+    if last_refresh:
+        try:
+            ts = datetime.fromisoformat(last_refresh)
+            refresh_str = ts.strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            refresh_str = last_refresh
+    else:
+        refresh_str = "Never"
+
+    text = (
+        f"🌐 *Universe Mode Status*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Mode: {mode_str}\n"
+        f"📋 Exchanges: `{exchanges}`\n"
+        f"🔍 Candidates loaded: `{len(candidates)}`\n"
+        f"🕐 Last refresh: `{refresh_str}`\n\n"
+        f"_Use /refresh to manually trigger a new universe scan._"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)

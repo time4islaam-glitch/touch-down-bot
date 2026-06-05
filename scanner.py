@@ -34,6 +34,9 @@ PARTIAL_ALERT_MIN_SCORE = int(os.environ.get("PARTIAL_ALERT_MIN_SCORE", 5))
 # Regime filter — when True, only fire alerts in TARGET_REGIMES (BULL_HIGH_VOL, CORRECTION)
 REGIME_FILTER_ENABLED = os.environ.get("REGIME_FILTER", "true").lower() == "true"
 
+# Universe mode — scan pre-screened exchange candidates instead of manual watchlist
+UNIVERSE_MODE = os.environ.get("UNIVERSE_MODE", "false").lower() == "true"
+
 
 # ── Message builders ───────────────────────────────────────────────────────────
 
@@ -178,6 +181,15 @@ async def run_scanner_loop(bot: Bot, chat_id: str) -> None:
     )
 
     while True:
+        if UNIVERSE_MODE:
+            from universe import refresh_universe, UNIVERSE_REFRESH_HOUR_UTC
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.hour == UNIVERSE_REFRESH_HOUR_UTC and now_utc.minute < (SCAN_INTERVAL_SECONDS // 60):
+                try:
+                    await refresh_universe(bot, chat_id)
+                except Exception as exc:
+                    logger.exception("Universe refresh error: %s", exc)
+
         try:
             await _run_single_scan(bot, chat_id)
         except Exception as exc:
@@ -189,11 +201,19 @@ async def run_scanner_loop(bot: Bot, chat_id: str) -> None:
 
 async def _run_single_scan(bot: Bot, chat_id: str) -> None:
     """One full pass across all tickers in the watchlist."""
-    watchlist = wl_store.load()
-
-    if not watchlist:
-        logger.info("Watchlist is empty — nothing to scan.")
-        return
+    if UNIVERSE_MODE:
+        from universe import load_candidates
+        candidates = load_candidates()
+        if not candidates:
+            logger.info("Universe mode: no candidates loaded yet — run /refresh first.")
+            return
+        # Build a minimal state dict matching watchlist format
+        watchlist = {t: {} for t in candidates}
+    else:
+        watchlist = wl_store.load()
+        if not watchlist:
+            logger.info("Watchlist is empty — nothing to scan.")
+            return
 
     if not _is_market_hours():
         logger.info("Outside market hours — scan skipped.")
