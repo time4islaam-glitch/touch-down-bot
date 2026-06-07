@@ -17,7 +17,7 @@ from telegram.ext import ContextTypes
 import watchlist as wl_store
 from analysis import validate_ticker
 from regime import get_regime_context, TARGET_REGIMES, REGIME_LABELS
-from regime_state import load_regime_state
+from regime_state import load_state, save_weekly, save_daily, is_market_active, is_day_active
 
 logger = logging.getLogger(__name__)
 
@@ -283,47 +283,140 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+# ── /status ───────────────────────────────────────────────────────────────────
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /status — Show the current three-tier regime gate state at a glance.
+    Tells the user exactly why the bot is active or silent right now.
+    """
+    state  = load_state()
+    weekly = state.get("weekly", {})
+    daily  = state.get("daily",  {})
+
+    # Weekly gate
+    if weekly:
+        w_regime  = weekly.get("label", "Unknown")
+        w_active  = weekly.get("market_active", False)
+        w_week    = weekly.get("week_of", "—")
+        w_checked = weekly.get("checked_at", "")
+        try:
+            w_ts = datetime.fromisoformat(w_checked).strftime("%a %d %b %H:%M UTC")
+        except Exception:
+            w_ts = w_checked
+        w_icon = "✅" if w_active else "⛔"
+        w_line = (
+            f"{w_icon} *Weekly gate:* `{w_regime}`\n"
+            f"  Week of `{w_week}` · checked `{w_ts}`\n"
+            f"  {'Scanning active this week' if w_active else 'Bot silent this week'}"
+        )
+    else:
+        w_line = "⚠️ *Weekly gate:* not yet run — use /refresh to trigger"
+
+    # Daily gate
+    if daily and weekly.get("market_active"):
+        d_regime  = daily.get("label", "Unknown")
+        d_active  = daily.get("day_active", False)
+        d_date    = daily.get("date", "—")
+        d_icon    = "✅" if d_active else "⏭️"
+        d_line = (
+            f"{d_icon} *Daily gate:* `{d_regime}`\n"
+            f"  `{d_date}` · "
+            f"{'Scanning today' if d_active else 'No scan today — not a target regime'}"
+        )
+    elif not weekly.get("market_active"):
+        d_line = "⛔ *Daily gate:* not checked — market inactive"
+    else:
+        d_line = "⏳ *Daily gate:* pending pre-market check today"
+
+    # Overall status
+    if is_day_active():
+        overall = "🟢 *Bot is ACTIVE — scanning universe during market hours*"
+    elif is_market_active():
+        overall = "🟡 *Bot is STANDBY — weekly gate open, daily gate closed*"
+    else:
+        overall = "🔴 *Bot is SILENT — weekly gate closed (non-bull regime)*"
+
+    # Target regimes reminder
+    target_str = " / ".join(
+        REGIME_LABELS[r] for r in sorted(TARGET_REGIMES) if r in REGIME_LABELS
+    )
+
+    text = (
+        f"📡 *Regime Gate Status*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{overall}\n\n"
+        f"{w_line}\n\n"
+        f"{d_line}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Target regimes: {target_str}_\n"
+        f"_Weekly check: Fridays post-close_\n"
+        f"_Daily check: weekdays 07:00 ET pre-market_\n"
+        f"_Use /refresh to force a regime re-check now_"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
 # ── /refresh ──────────────────────────────────────────────────────────────────
 
 async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /refresh — manually trigger a universe refresh.
-    Admin-only: only responds if the caller's Telegram user ID matches
-    the ADMIN_USER_ID env var.
-    Also available automatically post-close when regime is a target.
+    /refresh — Manually force a regime re-check right now.
+    Admin-only. Updates both weekly and daily gates regardless of schedule.
+    Use when market conditions have changed materially mid-week.
     """
     admin_id  = int(os.environ.get("ADMIN_USER_ID", "0"))
     caller_id = update.effective_user.id if update.effective_user else 0
 
     if admin_id == 0 or caller_id != admin_id:
         await update.message.reply_text(
-            "⛔ This command is restricted to the bot administrator.",
+            "⛔ /refresh is restricted to the bot administrator.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     await update.message.reply_text(
-        "🔄 Starting universe refresh… this may take a few minutes.",
-        parse_mode=ParseMode.MARKDOWN,
+        "🔄 Running forced regime check…", parse_mode=ParseMode.MARKDOWN
     )
 
-    import asyncio
-    from universe import refresh_universe
-
     try:
-        count = await refresh_universe(
-            update.get_bot(),
-            str(update.effective_chat.id),
+        ctx = get_regime_context()
+        if not ctx:
+            await update.message.reply_text(
+                "❌ Could not fetch regime data. Try again shortly.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        # Write both tiers so the bot is immediately in a consistent state
+        save_weekly(ctx)
+        save_daily(ctx)
+
+        regime  = ctx.get("label", "Unknown")
+        bull    = ctx.get("regime") in {"BULL_TREND", "BULL_HIGH_VOL", "CORRECTION"}
+        target  = ctx.get("is_target", False)
+        close   = ctx.get("spy_close", 0)
+
+        status_icon = "✅" if target else "🟡" if bull else "⛔"
+        status_text = (
+            "Target regime — daily scans will run"
+            if target else
+            "Bull regime — daily gate will re-check each morning"
+            if bull else
+            "Non-bull regime — bot silent until next check"
         )
+
         await update.message.reply_text(
-            f"✅ Universe refresh complete — `{count}` candidates saved.",
+            f"✅ *Regime re-check complete*\n\n"
+            f"{status_icon} `{regime}`  (SPY ${close:.2f})\n"
+            f"_{status_text}_",
             parse_mode=ParseMode.MARKDOWN,
         )
+
     except Exception as exc:
         logger.exception("cmd_refresh error: %s", exc)
         await update.message.reply_text(
-            f"❌ Universe refresh failed: `{exc}`",
-            parse_mode=ParseMode.MARKDOWN,
+            f"❌ Refresh failed: `{exc}`", parse_mode=ParseMode.MARKDOWN
         )
 
 
@@ -352,7 +445,7 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         refresh_str = "Never"
 
     # Regime state from last post-close check
-    regime_state = load_regime_state()
+    regime_state = load_state()
     if regime_state:
         rs_date   = regime_state.get("date", "—")
         rs_label  = regime_state.get("label", "Unknown")

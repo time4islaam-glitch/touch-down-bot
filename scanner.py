@@ -1,30 +1,25 @@
 """
-scanner.py — Asynchronous background market-scanning loop.
+scanner.py — Three-tier gated market scanner.
+==============================================
+Single heartbeat loop (60s) that independently checks which tier
+it should be in and acts accordingly. All existing alert logic is
+unchanged — only the gating around it is new.
 
-Two distinct modes driven by a single 60-second heartbeat loop:
+TIER 1 — WEEKLY GATE  (Friday post-close, ~17:00 ET)
+  Runs the SPY regime check once per week.
+  Sends a Telegram summary of the weekly regime reading.
+  Sets market_active flag in regime_state.json.
+  If not bull → silent message sent, bot quiet for the week.
 
-POST-CLOSE MODE  (once per trading day, after US market close)
-─────────────────────────────────────────────────────────────
-  • Fires once the US/Eastern clock passes 17:00 ET (DST-aware).
-  • Runs the regime check against confirmed daily SPY closing data.
-  • Saves the result to regime_state.json via regime_state module.
-  • If regime is a target: triggers automatic universe refresh, sends
-    a confirmation Telegram message.
-  • If regime is not a target: sends a skip Telegram message.
-  • Will not fire again until the next calendar day (US/Eastern).
+TIER 2 — DAILY GATE  (each weekday, pre-market ~07:00 ET)
+  Only runs if market_active is True.
+  Runs a fresh SPY regime check using prior day's confirmed close.
+  Sets day_active flag in regime_state.json.
+  Sends a brief pre-market Telegram note (active or skip).
 
-INTRADAY MODE  (next trading day, during market hours)
-──────────────────────────────────────────────────────
-  • Reads yesterday's saved regime_state.json.
-  • If is_target is True, scans all tickers every INTRADAY_SCAN_INTERVAL
-    seconds (default 900 = 15 min) during market hours (09:30–16:00 ET,
-    DST-aware).
-  • If is_target is False, does nothing until the next post-close check.
-  • Full alert / watch alert logic unchanged.
-
-DST handling:
-  All market open/close times are derived from the US/Eastern timezone via
-  pytz so EDT (UTC-4) and EST (UTC-5) are handled automatically year-round.
+TIER 3 — INTRADAY UNIVERSE SCAN  (every SCAN_INTERVAL seconds)
+  Only runs if both market_active AND day_active are True.
+  Existing Setup A logic unchanged — 8 checks, same alerts, same stops.
 """
 
 import asyncio
@@ -37,13 +32,13 @@ from telegram import Bot
 from telegram.constants import ParseMode
 
 import watchlist as wl_store
-from analysis import fetch_and_analyse, AnalysisResult, _score_label
-from regime import is_target_regime, get_regime_context, TARGET_REGIMES, REGIME_LABELS
+from analysis import fetch_and_analyse, AnalysisResult, _score_label_a
+from regime import get_regime_context, TARGET_REGIMES, REGIME_LABELS
 from regime_state import (
-    save_regime_state,
-    load_regime_state,
-    is_today_target,
-    has_run_today,
+    save_weekly, save_daily,
+    is_market_active, is_day_active,
+    has_weekly_run_this_week, has_daily_run_today,
+    load_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,57 +47,102 @@ logger = logging.getLogger(__name__)
 EASTERN = pytz.timezone("US/Eastern")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# How often (seconds) intraday ticker scans run during market hours.
-INTRADAY_SCAN_INTERVAL = int(os.environ.get("INTRADAY_SCAN_INTERVAL", 900))
-
-# Alert cooldown — suppress repeated alerts for the same ticker.
-ALERT_COOLDOWN_HOURS = int(os.environ.get("ALERT_COOLDOWN_HOURS", 4))
-
-# Minimum score for a "watching" partial alert.
+SCAN_INTERVAL_SECONDS   = int(os.environ.get("SCAN_INTERVAL",         900))  # 15 min default
+ALERT_COOLDOWN_HOURS    = int(os.environ.get("ALERT_COOLDOWN_HOURS",    4))
 PARTIAL_ALERT_MIN_SCORE = int(os.environ.get("PARTIAL_ALERT_MIN_SCORE", 5))
+UNIVERSE_MODE           = os.environ.get("UNIVERSE_MODE", "false").lower() == "true"
 
-# Regime filter toggle.
-REGIME_FILTER_ENABLED = os.environ.get("REGIME_FILTER", "true").lower() == "true"
-
-# Universe mode — scan pre-screened candidates instead of manual watchlist.
-UNIVERSE_MODE = os.environ.get("UNIVERSE_MODE", "false").lower() == "true"
-
-# How often the heartbeat loop wakes to check which mode applies (seconds).
-_HEARTBEAT_INTERVAL = 60
+# Heartbeat — how often the loop wakes to check which tier applies
+_HEARTBEAT_SECONDS = 60
 
 
-# ── Market time helpers ────────────────────────────────────────────────────────
+# ── Time helpers ───────────────────────────────────────────────────────────────
 
-def _now_eastern() -> datetime:
-    """Current time in US/Eastern (DST-aware)."""
+def _now_et() -> datetime:
     return datetime.now(EASTERN)
 
 
-def _is_post_close() -> bool:
+def _is_friday_post_close() -> bool:
+    """True on Fridays after 17:00 ET — weekly gate window."""
+    now = _now_et()
+    return now.weekday() == 4 and now.hour >= 17   # Friday = 4
+
+
+def _is_pre_market_check_time() -> bool:
     """
-    True on weekdays once the US market has closed for the day.
-    Market close = 17:00 ET. DST handled automatically via pytz.
+    True Mon–Fri between 07:00 and 07:59 ET.
+    Pre-market window for the daily gate check.
+    Using prior-close data so this is always based on confirmed prices.
     """
-    now_et = _now_eastern()
-    if now_et.weekday() >= 5:          # Saturday=5, Sunday=6
-        return False
-    return now_et.hour >= 17
+    now = _now_et()
+    return now.weekday() < 5 and now.hour == 7
 
 
 def _is_market_hours() -> bool:
-    """
-    True during regular US equity market hours on weekdays.
-    09:30–16:00 ET. DST handled automatically via pytz.
-    """
-    now_et = _now_eastern()
-    if now_et.weekday() >= 5:
+    """True during regular US equity market hours Mon–Fri, 09:30–16:00 ET."""
+    now = _now_et()
+    if now.weekday() >= 5:
         return False
-    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return market_open <= now_et < market_close
+    market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return market_open <= now < market_close
 
 
 # ── Message builders ───────────────────────────────────────────────────────────
+
+def _build_weekly_active_msg(ctx: dict) -> str:
+    target_labels = " / ".join(
+        REGIME_LABELS[r] for r in sorted(TARGET_REGIMES) if r in REGIME_LABELS
+    )
+    return (
+        f"📅 *Weekly Regime Check*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ *Market is BULL — scanning active this week*\n"
+        f"🌐 Regime: `{ctx.get('label', '—')}`\n\n"
+        f"📊 *SPY Snapshot*\n"
+        f"  • Close:    `${ctx.get('spy_close', 0):.2f}`\n"
+        f"  • SMA50:    `${ctx.get('spy_sma50', 0):.2f}`\n"
+        f"  • SMA200:   `${ctx.get('spy_sma200', 0):.2f}`\n"
+        f"  • ATR Rank: `{ctx.get('atr_rank_pct', 0):.1f}th pct`\n\n"
+        f"_Daily pre-market checks will run Mon–Fri._\n"
+        f"_Alerts fire only on `{target_labels}` days._"
+    )
+
+
+def _build_weekly_silent_msg(ctx: dict) -> str:
+    return (
+        f"📅 *Weekly Regime Check*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⛔ *Market is NOT BULL — bot silent this week*\n"
+        f"🌐 Regime: `{ctx.get('label', '—')}`\n\n"
+        f"📊 *SPY Snapshot*\n"
+        f"  • Close:    `${ctx.get('spy_close', 0):.2f}`\n"
+        f"  • SMA50:    `${ctx.get('spy_sma50', 0):.2f}`\n"
+        f"  • SMA200:   `${ctx.get('spy_sma200', 0):.2f}`\n\n"
+        f"_No daily checks or ticker scans until next Friday._\n"
+        f"_Use /refresh to force a regime re-check if conditions change._"
+    )
+
+
+def _build_daily_active_msg(ctx: dict) -> str:
+    return (
+        f"🌅 *Pre-Market Check — Scanning Today*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Regime: `{ctx.get('label', '—')}`\n"
+        f"_Intraday universe scan active — every "
+        f"{SCAN_INTERVAL_SECONDS // 60} min during market hours._"
+    )
+
+
+def _build_daily_skip_msg(ctx: dict) -> str:
+    return (
+        f"🌅 *Pre-Market Check — No Scan Today*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏭️ Regime: `{ctx.get('label', '—')}`\n"
+        f"_Market is bull but today is not a target regime day._\n"
+        f"_No ticker scans until tomorrow's pre-market check._"
+    )
+
 
 def _check_row(label: str, passed: bool, detail: str = "") -> str:
     icon   = "✅" if passed else "❌"
@@ -110,366 +150,261 @@ def _check_row(label: str, passed: bool, detail: str = "") -> str:
     return f"  {icon} {label}{suffix}"
 
 
-def _build_full_alert(result: AnalysisResult, persisted_regime: dict | None = None) -> str:
-    c = result.checks
-    s = result.stops
-    ma_hits = ", ".join(result.triggered_mas) if result.triggered_mas else "—"
+def _build_full_alert(result: AnalysisResult, regime_label: str) -> str:
+    a  = result.setup_a
+    s  = result.stops
+    ma = ", ".join(a.triggered_mas) if a.triggered_mas else "—"
+    vr = (f"{result.volume_current / result.volume_ma20:.1f}× avg"
+          if result.volume_ma20 and result.volume_ma20 > 0 else "n/a")
 
-    vol_ratio = (
-        f"{result.volume_current / result.volume_ma20:.1f}x avg"
-        if result.volume_ma20 and result.volume_ma20 > 0
-        else "n/a"
-    )
-
-    score_label = _score_label(c.score)
-
-    checks_block = "\n".join([
-        _check_row("Uptrend  (Price > 200 SMA)",        c.uptrend),
-        _check_row("SMA200 Slope  (rising 20 bars)",    c.sma200_slope),
-        _check_row("MA Proximity  (low ≤ 1.5%)",        c.ma_proximity,   ma_hits),
-        _check_row("Bullish Candle  (green + upper ½)", c.bullish_candle),
-        _check_row("Volume  (≥ 20-day avg)",             c.volume_ok,      vol_ratio),
-        _check_row("EMA Slope  (62 EMA rising)",         c.ema_slope_ok),
-        _check_row("Clean Structure  (5-bar hold)",      c.clean_structure),
-        _check_row("Not Overextended  (≤ 10% > SMA)",   c.not_overextended),
+    checks = "\n".join([
+        _check_row("Uptrend  (Price > 200 SMA)",       a.uptrend),
+        _check_row("SMA200 Slope  (rising 20 bars)",   a.sma200_slope),
+        _check_row("MA Proximity  (low ≤ 1.5%)",       a.ma_proximity,   ma),
+        _check_row("Bullish Candle  (green + upper ½)", a.bullish_candle),
+        _check_row("Volume  (≥ 20-day avg)",            a.volume_ok,      vr),
+        _check_row("EMA Slope  (62 EMA rising)",        a.ema_slope_ok),
+        _check_row("Clean Structure  (5-bar hold)",     a.clean_structure),
+        _check_row("Not Overextended  (≤ 10% > SMA)",  a.not_overextended),
     ])
-
-    # Use the persisted regime state that gated this scan (Issue #8).
-    # This guarantees the alert shows the same regime used for gating, not a
-    # potentially different freshly-calculated value.
-    reg = persisted_regime or {}
-    regime_line = (
-        f"\n🌐 *Market Regime:*  `{reg.get('label', '—')}`  "
-        f"_(SPY SMA50: ${reg.get('spy_sma50', 0):.2f} "
-        f"/ SMA200: ${reg.get('spy_sma200', 0):.2f})_\n"
-    ) if reg else ""
 
     return (
         f"🚨 *TRADE ALERT — {result.ticker}* 🚨\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 *Entry Price:*  `${result.current_price:.2f}`\n"
-        f"📊 *Signal Quality:*  {score_label}  `{c.score}/8`\n\n"
+        f"📊 *Signal Quality:*  {_score_label_a(a.score)}  `{a.score}/8`\n"
+        f"🌐 *Regime:*  `{regime_label}`\n\n"
         f"📐 *Moving Averages*\n"
         f"  • 200 SMA → `${result.sma_200:.2f}`\n"
         f"  • 62  EMA → `${result.ema_62:.2f}`\n"
-        f"  • 79  EMA → `${result.ema_79:.2f}`\n\n"
-        f"🎯 *MA Touch:*  `{ma_hits}`\n"
-        f"{regime_line}"
+        f"  • 79  EMA → `${result.ema_79:.2f}`\n"
+        f"  • ATR 14  → `${result.atr_14:.2f}`\n\n"
+        f"🎯 *MA Touch:*  `{ma}`\n\n"
         f"🛡️ *Stop Loss Levels*\n"
-        f"  • Hard stop  → `${s.hard_stop:.2f}`  _(79 EMA − 1× ATR)_\n"
-        f"  • Primary    → `${s.primary_stop:.2f}`  _(close below 79 EMA)_\n"
-        f"  • Breakdown  → `${s.catastrophic_stop:.2f}`  _(200 SMA breach)_\n"
-        f"  • 🎯 Target  → `${s.partial_target:.2f}`  _(2R partial exit)_\n"
-        f"  • Trail at   → `${s.trail_activation:.2f}`  _(+3% activation)_\n"
-        f"  • ATR(14):  `${s.atr14:.2f}`  |  Risk: `{s.risk_pct:.2f}%`\n\n"
-        f"✅ *Entry Checks  [{c.score}/8]*\n"
-        f"{checks_block}\n\n"
+        f"  • Hard stop → `${s.hard_stop:.2f}`  _(79 EMA − 1× ATR)_\n"
+        f"  • Primary   → `${s.primary_stop:.2f}`  _(close below 79 EMA)_\n"
+        f"  • Breakdown → `${s.catastrophic_stop:.2f}`  _(200 SMA breach)_\n"
+        f"  • 2R Target → `${s.partial_target:.2f}`\n"
+        f"  • Trail at  → `${s.trail_activation:.2f}`  _(+3%)_\n"
+        f"  • Risk:  `{s.risk_pct:.2f}%` of entry\n\n"
+        f"✅ *Entry Checks  [{a.score}/8]*\n"
+        f"{checks}\n\n"
         f"🕐 `{result.timestamp.strftime('%Y-%m-%d %H:%M UTC')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Exit thesis: daily close below 79 EMA = stop triggered._"
+        f"_Exit: daily close below 79 EMA._"
     )
 
 
-def _build_watch_alert(result: AnalysisResult) -> str:
-    c = result.checks
-    ma_hits     = ", ".join(result.triggered_mas) if result.triggered_mas else "—"
-    score_label = _score_label(c.score)
-
-    failing = []
-    if not c.uptrend:          failing.append("uptrend (price > 200 SMA)")
-    if not c.sma200_slope:     failing.append("SMA200 slope rising (20-bar)")
-    if not c.ma_proximity:     failing.append("MA proximity touch (low ≤ 1.5%)")
-    if not c.bullish_candle:   failing.append("bullish candle confirmation")
-    if not c.volume_ok:        failing.append("above-average volume")
-    if not c.ema_slope_ok:     failing.append("62 EMA slope rising")
-    if not c.clean_structure:  failing.append("clean 5-bar EMA structure")
-    if not c.not_overextended: failing.append("price not overextended")
-
-    missing_str = "\n".join(f"  ⏳ {f}" for f in failing)
-
+def _build_watch_alert(result: AnalysisResult, regime_label: str) -> str:
+    a  = result.setup_a
+    ma = ", ".join(a.triggered_mas) if a.triggered_mas else "—"
+    failing = [
+        lbl for check, lbl in [
+            (a.sma200_slope,    "SMA200 slope rising"),
+            (a.bullish_candle,  "bullish candle confirmation"),
+            (a.volume_ok,       "above-average volume"),
+            (a.ema_slope_ok,    "62 EMA slope rising"),
+            (a.clean_structure, "clean 5-bar EMA structure"),
+            (a.not_overextended,"price not overextended"),
+        ] if not check
+    ]
     return (
         f"👀 *WATCHING — {result.ticker}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 *Current Price:*  `${result.current_price:.2f}`\n"
-        f"📊 *Signal Quality:*  {score_label}  `{c.score}/8`\n"
-        f"🎯 *MA Touch:*  `{ma_hits}`\n\n"
-        f"⏳ *Still needed for full alert:*\n{missing_str}\n\n"
-        f"📐 *Levels*\n"
-        f"  • 200 SMA → `${result.sma_200:.2f}`\n"
-        f"  • 62  EMA → `${result.ema_62:.2f}`\n"
-        f"  • 79  EMA → `${result.ema_79:.2f}`\n\n"
-        f"🕐 `{result.timestamp.strftime('%Y-%m-%d %H:%M UTC')}`\n"
+        f"💰 *Price:*  `${result.current_price:.2f}`   "
+        f"🌐 `{regime_label}`\n"
+        f"📊 Score: `{a.score}/8`   🎯 Touch: `{ma}`\n\n"
+        f"⏳ *Still needed:*\n"
+        + "\n".join(f"  ⏳ {f}" for f in failing) +
+        f"\n\n🕐 `{result.timestamp.strftime('%Y-%m-%d %H:%M UTC')}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━"
     )
 
 
-def _build_regime_skip_message(reg_ctx: dict) -> str:
-    target_labels = ", ".join(
-        f"`{v}`" for k, v in REGIME_LABELS.items() if k in TARGET_REGIMES
-    )
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return (
-        f"🌐 *Daily Regime Check — Scan Skipped*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⛔ *Regime:*  `{reg_ctx.get('label', 'Unknown')}`\n"
-        f"_Scans are only active in: {target_labels}_\n\n"
-        f"📊 *SPY Snapshot*\n"
-        f"  • Close:    `${reg_ctx.get('spy_close', 0):.2f}`\n"
-        f"  • SMA50:    `${reg_ctx.get('spy_sma50', 0):.2f}`\n"
-        f"  • SMA200:   `${reg_ctx.get('spy_sma200', 0):.2f}`\n"
-        f"  • ATR Rank: `{reg_ctx.get('atr_rank_pct', 0):.1f}th percentile`\n\n"
-        f"_No intraday scanning will occur tomorrow._\n"
-        f"🕐 `{now_str}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-    )
+# ── Cooldown ───────────────────────────────────────────────────────────────────
 
-
-def _build_regime_active_message(reg_ctx: dict, ticker_count: int) -> str:
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    return (
-        f"🌐 *Daily Regime Check — Scan Active*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ *Regime:*  `{reg_ctx.get('label', 'Unknown')}`\n"
-        f"_Conditions met — {ticker_count} ticker(s) will be scanned intraday "
-        f"every {INTRADAY_SCAN_INTERVAL // 60} min tomorrow._\n\n"
-        f"📊 *SPY Snapshot*\n"
-        f"  • Close:    `${reg_ctx.get('spy_close', 0):.2f}`\n"
-        f"  • SMA50:    `${reg_ctx.get('spy_sma50', 0):.2f}`\n"
-        f"  • SMA200:   `${reg_ctx.get('spy_sma200', 0):.2f}`\n"
-        f"  • ATR Rank: `{reg_ctx.get('atr_rank_pct', 0):.1f}th percentile`\n\n"
-        f"🕐 `{now_str}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-# ── Cooldown helper ────────────────────────────────────────────────────────────
-
-def _cooldown_expired(last_alert_ts_str: str | None) -> bool:
-    """True if ALERT_COOLDOWN_HOURS have passed since the last alert."""
-    if last_alert_ts_str is None:
+def _cooldown_expired(last_ts_str: str | None) -> bool:
+    if last_ts_str is None:
         return True
     try:
-        last_ts = datetime.fromisoformat(last_alert_ts_str)
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - last_ts > timedelta(hours=ALERT_COOLDOWN_HOURS)
+        ts = datetime.fromisoformat(last_ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - ts > timedelta(hours=ALERT_COOLDOWN_HOURS)
     except (ValueError, TypeError):
         return True
 
 
-# ── Main scanner loop ──────────────────────────────────────────────────────────
+# ── Main loop ──────────────────────────────────────────────────────────────────
 
 async def run_scanner_loop(bot: Bot, chat_id: str) -> None:
     """
-    Single heartbeat loop waking every 60 seconds.
-
-    Each wake-up independently decides which mode to enter:
-      - POST-CLOSE: if it is past 17:00 ET and has not already run today
-        → run regime check, save state, optionally refresh universe.
-      - INTRADAY: if it is market hours and today's saved state is a target
-        → run a ticker scan, then sleep INTRADAY_SCAN_INTERVAL seconds.
-      - Otherwise: sleep until next heartbeat.
+    Single 60-second heartbeat.  Each wake-up independently decides which
+    tier applies:
+      • Friday post-close  → weekly regime check (once per week)
+      • Pre-market 07:xx   → daily regime check  (once per weekday, if active)
+      • Market hours       → ticker scan          (every SCAN_INTERVAL, if both active)
     """
     logger.info(
-        "Scanner loop started. IntraDay interval=%ds  Cooldown=%dh",
-        INTRADAY_SCAN_INTERVAL, ALERT_COOLDOWN_HOURS,
+        "Scanner started — heartbeat=%ds  scan_interval=%ds  cooldown=%dh",
+        _HEARTBEAT_SECONDS, SCAN_INTERVAL_SECONDS, ALERT_COOLDOWN_HOURS,
     )
 
-    # Tracks when the last intraday scan completed so we respect the interval.
     last_intraday_scan: datetime | None = None
 
     while True:
-        now_utc = datetime.now(timezone.utc)
+        try:
+            # ── TIER 1: Weekly regime gate (Friday post-close) ─────────────────
+            if _is_friday_post_close() and not has_weekly_run_this_week():
+                await _run_weekly_check(bot, chat_id)
 
-        # ── POST-CLOSE: regime check (once per calendar day) ──────────────────
-        if _is_post_close() and not has_run_today():
-            try:
-                await _run_post_close(bot, chat_id)
-            except Exception as exc:
-                logger.exception("Error in post-close routine: %s", exc)
+            # ── TIER 2: Daily regime gate (pre-market Mon–Fri) ─────────────────
+            elif (
+                _is_pre_market_check_time()
+                and not has_daily_run_today()
+                and is_market_active()
+            ):
+                await _run_daily_check(bot, chat_id)
 
-        # ── INTRADAY: ticker scan (every INTRADAY_SCAN_INTERVAL seconds) ──────
-        elif _is_market_hours() and is_today_target():
-            due = (
-                last_intraday_scan is None
-                or (now_utc - last_intraday_scan).total_seconds() >= INTRADAY_SCAN_INTERVAL
-            )
-            if due:
-                try:
-                    await _run_intraday_scan(bot, chat_id)
-                except Exception as exc:
-                    logger.exception("Error in intraday scan: %s", exc)
-                last_intraday_scan = datetime.now(timezone.utc)
+            # ── TIER 3: Intraday universe scan ─────────────────────────────────
+            elif _is_market_hours() and is_day_active():
+                now = datetime.now(timezone.utc)
+                due = (
+                    last_intraday_scan is None
+                    or (now - last_intraday_scan).total_seconds() >= SCAN_INTERVAL_SECONDS
+                )
+                if due:
+                    await _run_ticker_scan(bot, chat_id)
+                    last_intraday_scan = datetime.now(timezone.utc)
 
-        await asyncio.sleep(_HEARTBEAT_INTERVAL)
+        except Exception as exc:
+            logger.exception("Heartbeat error: %s", exc)
+
+        await asyncio.sleep(_HEARTBEAT_SECONDS)
 
 
-# ── Post-close routine ─────────────────────────────────────────────────────────
+# ── Tier 1: Weekly check ───────────────────────────────────────────────────────
 
-async def _run_post_close(bot: Bot, chat_id: str) -> None:
-    """
-    Runs once per trading day after 17:00 ET.
-    1. Force-refreshes the regime cache so confirmed closing SPY data is used.
-    2. Fetches regime context.
-    3. Saves result to regime_state.json.
-    4. Sends Telegram confirmation (active or skip).
-    5. If target regime: triggers automatic universe refresh.
-    """
-    logger.info("Post-close routine starting.")
-
-    # Force-refresh ensures we use the confirmed daily close, not a stale
-    # intraday cache built hours earlier (Issue #3).
-    reg_ctx = get_regime_context(force_refresh=True)
-    if not reg_ctx:
-        logger.warning("Post-close: could not retrieve regime context — skipping.")
+async def _run_weekly_check(bot: Bot, chat_id: str) -> None:
+    """Friday post-close: classify regime, set market_active, notify."""
+    logger.info("TIER 1 — Weekly regime check starting")
+    ctx = get_regime_context()
+    if not ctx:
+        logger.warning("Weekly check: could not fetch regime context")
         return
 
-    # Persist result for today
-    save_regime_state(reg_ctx)
+    save_weekly(ctx)
+    active = ctx.get("regime") in {"BULL_TREND", "BULL_HIGH_VOL", "CORRECTION"}
 
-    target = bool(reg_ctx.get("is_target", False))
-
-    if REGIME_FILTER_ENABLED and not target:
-        logger.info(
-            "Post-close: regime is %s — not a target. Intraday scanning suppressed tomorrow.",
-            reg_ctx.get("label"),
-        )
-        await _send(bot, chat_id, _build_regime_skip_message(reg_ctx))
-        return
-
-    # Regime is a target — run universe refresh FIRST so the count in the
-    # confirmation message reflects the freshly screened candidates (Issue #7).
-    logger.info(
-        "Post-close: regime is %s — target confirmed. Running universe refresh before notification.",
-        reg_ctx.get("label"),
-    )
-
-    try:
-        from universe import refresh_universe
-        await refresh_universe(bot, chat_id)
-    except Exception as exc:
-        logger.exception("Post-close: universe refresh failed: %s", exc)
-
-    # Determine ticker count AFTER refresh so the message is accurate (Issue #7).
-    if UNIVERSE_MODE:
-        from universe import load_candidates
-        ticker_count = len(load_candidates())
+    if active:
+        msg = _build_weekly_active_msg(ctx)
+        logger.info("Weekly check: %s — market ACTIVE this week", ctx.get("regime"))
     else:
-        ticker_count = len(wl_store.load())
+        msg = _build_weekly_silent_msg(ctx)
+        logger.info("Weekly check: %s — market SILENT this week", ctx.get("regime"))
 
-    await _send(bot, chat_id, _build_regime_active_message(reg_ctx, ticker_count))
+    await _send(bot, chat_id, msg)
 
 
-# ── Intraday scan routine ──────────────────────────────────────────────────────
+# ── Tier 2: Daily check ────────────────────────────────────────────────────────
 
-async def _run_intraday_scan(bot: Bot, chat_id: str) -> None:
-    """
-    Scans all tickers during market hours on days where the regime state
-    saved from the previous post-close check is a target regime.
-    """
+async def _run_daily_check(bot: Bot, chat_id: str) -> None:
+    """Pre-market: check today's regime, set day_active, notify."""
+    logger.info("TIER 2 — Daily pre-market regime check")
+    ctx = get_regime_context()
+    if not ctx:
+        logger.warning("Daily check: could not fetch regime context")
+        return
+
+    save_daily(ctx)
+    day_active = ctx.get("regime") in TARGET_REGIMES
+
+    if day_active:
+        msg = _build_daily_active_msg(ctx)
+        logger.info("Daily check: %s — scans ACTIVE today", ctx.get("regime"))
+    else:
+        msg = _build_daily_skip_msg(ctx)
+        logger.info("Daily check: %s — scans SKIPPED today", ctx.get("regime"))
+
+    await _send(bot, chat_id, msg)
+
+
+# ── Tier 3: Universe / watchlist scan ─────────────────────────────────────────
+
+async def _run_ticker_scan(bot: Bot, chat_id: str) -> None:
+    """Run Setup A across the full universe or watchlist."""
+    # Determine what to scan
     if UNIVERSE_MODE:
         from universe import load_candidates
         candidates = load_candidates()
         if not candidates:
-            logger.info("Intraday scan: no universe candidates — run /refresh.")
+            logger.info("Universe mode: no candidates — run /refresh")
             return
         watchlist = {t: {} for t in candidates}
     else:
         watchlist = wl_store.load()
         if not watchlist:
-            logger.info("Intraday scan: watchlist is empty.")
+            logger.info("Watchlist empty — nothing to scan")
             return
 
-    # Load persisted regime once per scan so every alert in this cycle uses
-    # the same regime context that gated the scan (Issue #8).
-    state = load_regime_state()
-    regime_label = state.get("label", "Unknown") if state else "Unknown"
+    # Get current regime label for alert messages
+    state = load_state()
+    regime_label = state.get("daily", {}).get("label", "Unknown")
 
-    logger.info(
-        "Intraday scan starting — %d ticker(s) | regime: %s",
-        len(watchlist), regime_label,
-    )
-
-    scan_start = datetime.now(timezone.utc)
+    logger.info("TIER 3 — Scanning %d ticker(s) | regime: %s",
+                len(watchlist), regime_label)
 
     for ticker, ticker_state in list(watchlist.items()):
-        await _process_ticker(bot, chat_id, watchlist, ticker, ticker_state, state)
-        await asyncio.sleep(2)
+        await _process_ticker(bot, chat_id, watchlist, ticker,
+                              ticker_state, regime_label)
+        await asyncio.sleep(2)   # keep event loop responsive
 
-    # Issue #6 — log actual elapsed time so real-world cadence can be verified.
-    elapsed = (datetime.now(timezone.utc) - scan_start).total_seconds()
-    logger.info(
-        "Intraday scan complete — %d ticker(s) in %.1fs "
-        "(configured interval: %ds; next scan due in ~%.0fs).",
-        len(watchlist), elapsed,
-        INTRADAY_SCAN_INTERVAL,
-        max(0, INTRADAY_SCAN_INTERVAL - elapsed),
-    )
+    logger.info("Scan complete")
 
-
-# ── Per-ticker processing ──────────────────────────────────────────────────────
 
 async def _process_ticker(
-    bot: Bot,
-    chat_id: str,
-    watchlist: dict,
-    ticker: str,
-    state: dict,
-    persisted_regime: dict | None = None,
+    bot: Bot, chat_id: str, watchlist: dict,
+    ticker: str, state: dict, regime_label: str,
 ) -> None:
-    """Analyse one ticker and dispatch the appropriate alert (or none)."""
     loop   = asyncio.get_running_loop()
-    result: AnalysisResult = await loop.run_in_executor(
-        None, fetch_and_analyse, ticker
-    )
+    result = await loop.run_in_executor(None, fetch_and_analyse, ticker)
 
     if result.error:
-        logger.warning("Skipping %s — analysis error: %s", ticker, result.error)
+        logger.warning("Skipping %s — %s", ticker, result.error)
         return
+
+    a = result.setup_a
 
     wl_store.update_ticker_state(
         watchlist, ticker,
         last_price = result.current_price,
-        trend      = "up" if result.checks.uptrend else "down",
-        last_score = result.checks.score,
+        trend      = "up" if a.uptrend else "down",
+        last_score = a.score,
     )
 
-    cooldown_clear = _cooldown_expired(state.get("last_alert_ts"))
+    cooldown_ok = _cooldown_expired(state.get("last_alert_ts"))
 
-    # ── Path A: All 8 checks pass → full TRADE ALERT ──────────────────────────
-    if result.checks.all_pass and cooldown_clear:
-        await _send(bot, chat_id, _build_full_alert(result, persisted_regime))
-        wl_store.update_ticker_state(
-            watchlist, ticker,
-            last_alert_ts=result.timestamp.isoformat(),
-        )
-        logger.info("FULL ALERT sent for %s  score=8/8  MAs=%s", ticker, result.triggered_mas)
+    if a.signal and cooldown_ok:
+        await _send(bot, chat_id, _build_full_alert(result, regime_label))
+        wl_store.update_ticker_state(watchlist, ticker,
+                                     last_alert_ts=result.timestamp.isoformat())
+        logger.info("ALERT: %s  score=8/8  MA=%s", ticker, a.triggered_mas)
 
-    elif result.checks.all_pass and not cooldown_clear:
-        logger.info("All checks pass for %s but cooldown active — suppressed.", ticker)
+    elif a.signal and not cooldown_ok:
+        logger.info("SUPPRESSED (cooldown): %s", ticker)
 
-    # ── Path B: Score >= threshold → WATCHING notice ───────────────────────────
-    elif (
-        result.checks.score >= PARTIAL_ALERT_MIN_SCORE
-        and result.checks.ma_proximity
-        and result.checks.uptrend
-        and cooldown_clear
-    ):
-        await _send(bot, chat_id, _build_watch_alert(result))
-        logger.info("WATCH ALERT sent for %s  score=%d/8.", ticker, result.checks.score)
+    elif (a.score >= PARTIAL_ALERT_MIN_SCORE
+          and a.ma_proximity and a.uptrend and cooldown_ok):
+        await _send(bot, chat_id, _build_watch_alert(result, regime_label))
+        logger.info("WATCHING: %s  score=%d/8", ticker, a.score)
 
     else:
-        logger.info(
-            "%s — no alert. score=%d/8  uptrend=%s  proximity=%s",
-            ticker, result.checks.score,
-            result.checks.uptrend, result.checks.ma_proximity,
-        )
+        logger.debug("%s — no signal. score=%d/8", ticker, a.score)
 
-
-# ── Telegram send ──────────────────────────────────────────────────────────────
 
 async def _send(bot: Bot, chat_id: str, text: str) -> None:
     try:
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+        await bot.send_message(chat_id=chat_id, text=text,
+                               parse_mode=ParseMode.MARKDOWN)
     except Exception as exc:
         logger.error("Telegram send failed: %s", exc)

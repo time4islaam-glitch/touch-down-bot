@@ -17,6 +17,7 @@ from commands import (
     cmd_addmany,
     cmd_remove,
     cmd_watchlist,
+    cmd_status,
     cmd_refresh,
     cmd_universe,
 )
@@ -89,6 +90,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addmany",   cmd_addmany))
     app.add_handler(CommandHandler("remove",    cmd_remove))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    app.add_handler(CommandHandler("status",   cmd_status))
     app.add_handler(CommandHandler("refresh",  cmd_refresh))
     app.add_handler(CommandHandler("universe", cmd_universe))
 
