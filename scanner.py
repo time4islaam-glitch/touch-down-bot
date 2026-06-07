@@ -32,7 +32,7 @@ from telegram import Bot
 from telegram.constants import ParseMode
 
 import watchlist as wl_store
-from analysis import fetch_and_analyse, AnalysisResult, _score_label_a
+from analysis import fetch_and_analyse, AnalysisResult, _score_label
 from regime import get_regime_context, TARGET_REGIMES, REGIME_LABELS
 from regime_state import (
     save_weekly, save_daily,
@@ -172,7 +172,7 @@ def _build_full_alert(result: AnalysisResult, regime_label: str) -> str:
         f"🚨 *TRADE ALERT — {result.ticker}* 🚨\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 *Entry Price:*  `${result.current_price:.2f}`\n"
-        f"📊 *Signal Quality:*  {_score_label_a(a.score)}  `{a.score}/8`\n"
+        f"📊 *Signal Quality:*  {_score_label(a.score)}  `{a.score}/8`\n"
         f"🌐 *Regime:*  `{regime_label}`\n\n"
         f"📐 *Moving Averages*\n"
         f"  • 200 SMA → `${result.sma_200:.2f}`\n"
