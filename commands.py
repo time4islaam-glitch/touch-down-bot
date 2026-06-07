@@ -17,6 +17,7 @@ from telegram.ext import ContextTypes
 import watchlist as wl_store
 from analysis import validate_ticker
 from regime import get_regime_context, TARGET_REGIMES, REGIME_LABELS
+from regime_state import load_regime_state
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/remove <TICKER>` — Remove a stock from the watchlist\n"
         "  _e.g._ `/remove AAPL`\n\n"
         "• `/watchlist` — Show all tracked tickers & status\n\n"
+        "• `/universe` — Show universe mode status & last regime state\n\n"
+        "• `/refresh` — Manually trigger a universe refresh _(admin only)_\n\n"
         "• `/help` — Show this message\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *Alert Logic*\n"
@@ -83,7 +86,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     ticker = context.args[0].upper().strip()
 
-    # Basic sanity check on ticker format
     if not ticker.isalpha() or len(ticker) > 10:
         await update.message.reply_text(
             f"⚠️ `{ticker}` doesn't look like a valid ticker symbol.",
@@ -100,7 +102,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Validate ticker via a quick yfinance call
     await update.message.reply_text(
         f"🔍 Validating `{ticker}`… please wait.",
         parse_mode=ParseMode.MARKDOWN,
@@ -121,7 +122,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wl_store.add_ticker(watchlist, ticker)
     await update.message.reply_text(
         f"✅ `{ticker}` has been added to the watchlist!\n"
-        f"It will be included in the next scheduled scan.",
+        f"It will be included in the next intraday scan.",
         parse_mode=ParseMode.MARKDOWN,
     )
     logger.info("Ticker %s added by user %s", ticker, update.effective_user.id)
@@ -146,7 +147,6 @@ async def cmd_addmany(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     tickers = [t.upper().strip() for t in context.args]
 
-    # Basic format validation
     invalid_format = [t for t in tickers if not t.isalpha() or len(t) > 10]
     if invalid_format:
         await update.message.reply_text(
@@ -157,7 +157,7 @@ async def cmd_addmany(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     watchlist = wl_store.load()
     already = [t for t in tickers if t in watchlist]
-    to_add = [t for t in tickers if t not in watchlist]
+    to_add  = [t for t in tickers if t not in watchlist]
 
     if not to_add:
         await update.message.reply_text(
@@ -215,10 +215,9 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    ticker = context.args[0].upper().strip()
+    ticker    = context.args[0].upper().strip()
     watchlist = wl_store.load()
-
-    removed = wl_store.remove_ticker(watchlist, ticker)
+    removed   = wl_store.remove_ticker(watchlist, ticker)
 
     if removed:
         await update.message.reply_text(
@@ -249,9 +248,9 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines = ["📋 *Current Watchlist*\n━━━━━━━━━━━━━━━━━━━━━━"]
 
     for ticker in sorted(watchlist):
-        state = watchlist[ticker]
-        price     = state.get("last_price")
-        trend     = state.get("trend")
+        state      = watchlist[ticker]
+        price      = state.get("last_price")
+        trend      = state.get("trend")
         last_alert = state.get("last_alert_ts")
 
         price_str = f"${price:.2f}" if price else "—"
@@ -259,7 +258,7 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         if last_alert:
             try:
-                ts = datetime.fromisoformat(last_alert)
+                ts        = datetime.fromisoformat(last_alert)
                 alert_str = ts.strftime("%m/%d %H:%M UTC")
             except ValueError:
                 alert_str = last_alert
@@ -291,8 +290,9 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     /refresh — manually trigger a universe refresh.
     Admin-only: only responds if the caller's Telegram user ID matches
     the ADMIN_USER_ID env var.
+    Also available automatically post-close when regime is a target.
     """
-    admin_id = int(os.environ.get("ADMIN_USER_ID", "0"))
+    admin_id  = int(os.environ.get("ADMIN_USER_ID", "0"))
     caller_id = update.effective_user.id if update.effective_user else 0
 
     if admin_id == 0 or caller_id != admin_id:
@@ -331,10 +331,11 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /universe — show current universe mode status, candidate count, and last refresh time.
+    /universe — show universe mode status, candidate count, last refresh time,
+    and the saved regime state from the most recent post-close check.
     """
     from universe import load_candidates, get_last_refresh_time, ENABLED_EXCHANGES
-    from scanner import UNIVERSE_MODE
+    from scanner import UNIVERSE_MODE, INTRADAY_SCAN_INTERVAL
 
     candidates   = load_candidates()
     last_refresh = get_last_refresh_time()
@@ -343,12 +344,30 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if last_refresh:
         try:
-            ts = datetime.fromisoformat(last_refresh)
+            ts          = datetime.fromisoformat(last_refresh)
             refresh_str = ts.strftime("%Y-%m-%d %H:%M UTC")
         except ValueError:
             refresh_str = last_refresh
     else:
         refresh_str = "Never"
+
+    # Regime state from last post-close check
+    regime_state = load_regime_state()
+    if regime_state:
+        rs_date   = regime_state.get("date", "—")
+        rs_label  = regime_state.get("label", "Unknown")
+        rs_target = "✅ Active" if regime_state.get("is_target") else "⛔ Inactive"
+        rs_str = (
+            f"\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌐 *Last Post-Close Regime Check*\n"
+            f"  • Date:   `{rs_date}`\n"
+            f"  • Regime: `{rs_label}`\n"
+            f"  • Status: {rs_target}\n"
+            f"  • Intraday scanning: "
+            f"{'every ' + str(INTRADAY_SCAN_INTERVAL // 60) + ' min' if regime_state.get('is_target') else 'suppressed'}"
+        )
+    else:
+        rs_str = "\n\n_No post-close regime check has run yet._"
 
     text = (
         f"🌐 *Universe Mode Status*\n"
@@ -356,7 +375,8 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Mode: {mode_str}\n"
         f"📋 Exchanges: `{exchanges}`\n"
         f"🔍 Candidates loaded: `{len(candidates)}`\n"
-        f"🕐 Last refresh: `{refresh_str}`\n\n"
-        f"_Use /refresh to manually trigger a new universe scan._"
+        f"🕐 Last refresh: `{refresh_str}`"
+        f"{rs_str}\n\n"
+        f"_Use /refresh to manually trigger a universe refresh._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)

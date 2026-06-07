@@ -195,6 +195,16 @@ def _build_cache() -> None:
         logger.exception("regime: error building cache: %s", exc)
 
 
+def _invalidate_cache() -> None:
+    """
+    Force the cache to be treated as stale so the next call to
+    get_current_regime / get_regime_context re-downloads SPY data.
+    Must be called while holding _cache_lock.
+    """
+    global _cache_built_at
+    _cache_built_at = None
+
+
 def _cache_is_stale() -> bool:
     """Return True if cache is absent or older than _CACHE_TTL."""
     if _cache_built_at is None or _cached_regime_series is None:
@@ -224,13 +234,22 @@ def is_target_regime() -> bool:
     return get_current_regime() in TARGET_REGIMES
 
 
-def get_regime_context() -> dict:
+def get_regime_context(force_refresh: bool = False) -> dict:
     """
     Returns a dict for inclusion in Telegram alert messages.
     Returns empty dict on error.
+
+    Args:
+        force_refresh: When True, invalidates the in-memory cache before
+            fetching so the call always downloads fresh SPY data from
+            yfinance.  Pass True from the post-close routine to guarantee
+            confirmed closing prices are used (Issue #3).
     """
     try:
         with _cache_lock:
+            if force_refresh:
+                _invalidate_cache()
+                logger.info("regime: cache invalidated for post-close force-refresh.")
             if _cache_is_stale():
                 _build_cache()
             if _cached_regime_series is None or _cached_spy_data is None:
