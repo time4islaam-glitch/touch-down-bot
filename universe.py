@@ -37,11 +37,15 @@ UNIVERSE_REFRESH_HOUR_UTC = int(os.environ.get("UNIVERSE_REFRESH_HOUR", 4))
 ENABLED_EXCHANGES         = os.environ.get("EXCHANGES", "NASDAQ,NYSE").upper().split(",")
 
 # Pre-screen thresholds
-MIN_PRICE        = 1.00          # ignore penny stocks
+MIN_PRICE        = 5.00          # ignore penny stocks / micro-caps
 MIN_AVG_VOLUME   = 500_000       # 30-day avg shares/day
-MAX_TICKERS_BATCH = 500          # max tickers processed per exchange per night
 BATCH_SIZE       = 50            # tickers per yfinance batch download
 BATCH_SLEEP_S    = 0.5           # seconds between batches
+PROGRESS_EVERY_N_BATCHES = 10    # send a Telegram progress update every N batches
+
+# SPAC / unit / warrant / rights suffixes to exclude (common single-letter
+# suffixes appended to a SPAC's base ticker, e.g. ABCDU, ABCDW, ABCDR)
+SPAC_SUFFIXES = ("U", "W", "R")
 
 # Exchange CSV sources
 NASDAQ_CSV_URL = (
@@ -92,6 +96,28 @@ LSE_TICKERS: list[str] = [
 
 # ── Ticker list fetchers ───────────────────────────────────────────────────────
 
+def _is_spac_unit_or_warrant(symbol: str) -> bool:
+    """
+    True if the symbol looks like a SPAC unit/warrant/rights ticker rather
+    than the SPAC's common stock — e.g. ABCDU (unit), ABCDW (warrant),
+    ABCDR (rights). These trade as derivatives of the underlying SPAC and
+    are typically illiquid and not suitable for this strategy.
+
+    Heuristic: 4+ character symbol ending in U/W/R where the base symbol
+    (without the suffix) is itself 3-5 characters — i.e. looks like a
+    "<base><suffix>" SPAC ticker rather than a normal 4-5 letter stock.
+    """
+    if len(symbol) < 4:
+        return False
+    if symbol[-1] not in SPAC_SUFFIXES:
+        return False
+    # A normal NASDAQ/NYSE ticker can legitimately end in U/W/R (e.g. "GURU"),
+    # so only flag it if trimming the suffix still leaves a plausible base
+    # ticker AND the full symbol is at the longer end (5 chars) — SPAC
+    # unit/warrant tickers are almost always 5 characters.
+    return len(symbol) == 5
+
+
 def _fetch_nasdaq_tickers() -> list[str]:
     """Download NASDAQ-listed CSV and return symbol list."""
     try:
@@ -99,8 +125,13 @@ def _fetch_nasdaq_tickers() -> list[str]:
         symbols = df["Symbol"].dropna().astype(str).str.strip().tolist()
         # Basic sanity: alpha-only, 1–5 chars
         symbols = [s for s in symbols if s.isalpha() and 1 <= len(s) <= 5]
-        logger.info("NASDAQ: fetched %d raw tickers", len(symbols))
-        return symbols[:MAX_TICKERS_BATCH]
+        before = len(symbols)
+        symbols = [s for s in symbols if not _is_spac_unit_or_warrant(s)]
+        logger.info(
+            "NASDAQ: fetched %d raw tickers (%d after SPAC unit/warrant filter)",
+            before, len(symbols),
+        )
+        return symbols
     except Exception as exc:
         logger.error("Failed to fetch NASDAQ ticker list: %s", exc)
         return []
@@ -112,8 +143,13 @@ def _fetch_nyse_tickers() -> list[str]:
         df = pd.read_csv(NYSE_CSV_URL)
         symbols = df["ACT Symbol"].dropna().astype(str).str.strip().tolist()
         symbols = [s for s in symbols if s.isalpha() and 1 <= len(s) <= 5]
-        logger.info("NYSE: fetched %d raw tickers", len(symbols))
-        return symbols[:MAX_TICKERS_BATCH]
+        before = len(symbols)
+        symbols = [s for s in symbols if not _is_spac_unit_or_warrant(s)]
+        logger.info(
+            "NYSE: fetched %d raw tickers (%d after SPAC unit/warrant filter)",
+            before, len(symbols),
+        )
+        return symbols
     except Exception as exc:
         logger.error("Failed to fetch NYSE ticker list: %s", exc)
         return []
@@ -122,7 +158,7 @@ def _fetch_nyse_tickers() -> list[str]:
 def _fetch_lse_tickers() -> list[str]:
     """Return the curated FTSE 350 static list."""
     logger.info("LSE: using static list of %d tickers", len(LSE_TICKERS))
-    return LSE_TICKERS[:MAX_TICKERS_BATCH]
+    return LSE_TICKERS
 
 
 # ── Pre-screen filter ──────────────────────────────────────────────────────────
@@ -276,6 +312,19 @@ async def refresh_universe(bot, chat_id: str) -> int:
     candidates: list[str] = []
     batches = [all_raw[i : i + BATCH_SIZE] for i in range(0, len(all_raw), BATCH_SIZE)]
 
+    if batches:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"\U0001f50e Pre-screening `{len(all_raw)}` tickers "
+                    f"across `{len(batches)}` batches\u2026"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.error("Failed to send universe refresh start notification: %s", exc)
+
     for idx, batch in enumerate(batches, 1):
         passed = await loop.run_in_executor(None, _prescreen_batch, batch)
         candidates.extend(passed)
@@ -283,6 +332,20 @@ async def refresh_universe(bot, chat_id: str) -> int:
             "Pre-screen batch %d/%d: %d/%d passed",
             idx, len(batches), len(passed), len(batch),
         )
+
+        if idx % PROGRESS_EVERY_N_BATCHES == 0 and idx < len(batches):
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u23f3 Universe refresh progress: batch `{idx}/{len(batches)}` \u2014 "
+                        f"`{len(candidates)}` candidates so far"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:
+                logger.error("Failed to send universe refresh progress update: %s", exc)
+
         if idx < len(batches):
             await asyncio.sleep(BATCH_SLEEP_S)
 
@@ -292,12 +355,12 @@ async def refresh_universe(bot, chat_id: str) -> int:
     # Telegram notification
     exchanges_str = ", ".join(ENABLED_EXCHANGES)
     msg = (
-        f"🌐 *Universe Refresh Complete*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 Exchanges scanned: `{exchanges_str}`\n"
-        f"🔍 Raw tickers fetched: `{len(all_raw)}`\n"
-        f"✅ Candidates passing pre-screen: `{len(candidates)}`\n"
-        f"🕐 `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}`"
+        f"\U0001f310 *Universe Refresh Complete*\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f4cb Exchanges scanned: `{exchanges_str}`\n"
+        f"\U0001f50d Raw tickers fetched: `{len(all_raw)}`\n"
+        f"\u2705 Candidates passing pre-screen: `{len(candidates)}`\n"
+        f"\U0001f550 `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}`"
     )
     try:
         await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
