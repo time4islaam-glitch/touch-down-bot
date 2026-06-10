@@ -55,7 +55,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  _e.g._ `/remove AAPL`\n\n"
         "• `/watchlist` — Show all tracked tickers & status\n\n"
         "• `/universe` — Show universe mode status & last regime state\n\n"
-        "• `/refresh` — Manually trigger a universe refresh _(admin only)_\n\n"
+        "• `/refresh` — Manually trigger a regime re-check _(admin only)_\n\n"
+        "• `/refreshuniverse` — Rescan exchanges & rebuild candidate list _(admin only)_\n\n"
         "• `/help` — Show this message\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *Alert Logic*\n"
@@ -470,6 +471,43 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🔍 Candidates loaded: `{len(candidates)}`\n"
         f"🕐 Last refresh: `{refresh_str}`"
         f"{rs_str}\n\n"
-        f"_Use /refresh to manually trigger a universe refresh._"
+        f"_Use /refreshuniverse to rescan exchanges for candidates._"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ── /refreshuniverse ──────────────────────────────────────────────────────────
+
+async def cmd_refreshuniverse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /refreshuniverse — Manually rescan all enabled exchanges (NASDAQ/NYSE/LSE),
+    apply pre-screen filters, and rebuild candidates.json.
+    Admin-only. This is the full universe ticker scan, separate from /refresh
+    (which only re-runs the regime gate check).
+    """
+    from universe import refresh_universe, ENABLED_EXCHANGES
+
+    admin_id  = int(os.environ.get("ADMIN_USER_ID", "0"))
+    caller_id = update.effective_user.id if update.effective_user else 0
+
+    if admin_id == 0 or caller_id != admin_id:
+        await update.message.reply_text(
+            "\u26d4 /refreshuniverse is restricted to the bot administrator.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text(
+        f"\U0001f504 Refreshing universe \u2014 scanning `{', '.join(ENABLED_EXCHANGES)}`\u2026 "
+        f"this may take a few minutes.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        count = await refresh_universe(context.bot, str(update.effective_chat.id))
+        logger.info("Universe refresh complete via /refreshuniverse \u2014 %d candidates", count)
+    except Exception as exc:
+        logger.exception("cmd_refreshuniverse error: %s", exc)
+        await update.message.reply_text(
+            f"\u274c Universe refresh failed: `{exc}`", parse_mode=ParseMode.MARKDOWN
+        )
