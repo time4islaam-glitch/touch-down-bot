@@ -96,7 +96,10 @@ def main() -> None:
 
     logger.info("Bot starting — polling for updates…")
     # run_polling blocks forever; drop_pending_updates avoids replaying old cmds
-    app.run_polling(drop_pending_updates=True)
+    # poll_interval/timeout: this bot is checked rarely during the day, so we
+    # don't need sub-10-second responsiveness -- poll every 30s instead of
+    # the default ~10s to cut getUpdates call volume (and log noise) drastically.
+    app.run_polling(drop_pending_updates=True, poll_interval=30.0, timeout=10)
 
 
 if __name__ == "__main__":

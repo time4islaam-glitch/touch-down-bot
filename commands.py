@@ -428,7 +428,7 @@ async def cmd_universe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     and the saved regime state from the most recent post-close check.
     """
     from universe import load_candidates, get_last_refresh_time, ENABLED_EXCHANGES
-    from scanner import UNIVERSE_MODE, INTRADAY_SCAN_INTERVAL
+    from scanner import UNIVERSE_MODE, SCAN_INTERVAL_SECONDS as INTRADAY_SCAN_INTERVAL
 
     candidates   = load_candidates()
     last_refresh = get_last_refresh_time()
