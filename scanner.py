@@ -26,6 +26,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytz
 from telegram import Bot
@@ -51,6 +52,14 @@ SCAN_INTERVAL_SECONDS   = int(os.environ.get("SCAN_INTERVAL",         900))  # 1
 ALERT_COOLDOWN_HOURS    = int(os.environ.get("ALERT_COOLDOWN_HOURS",    4))
 PARTIAL_ALERT_MIN_SCORE = int(os.environ.get("PARTIAL_ALERT_MIN_SCORE", 5))
 UNIVERSE_MODE           = os.environ.get("UNIVERSE_MODE", "false").lower() == "true"
+
+# Cap on alerts sent per scan cycle (universe mode can surface far more
+# than this many qualifying tickers — only the top-ranked ones are sent)
+MAX_FULL_ALERTS_PER_SCAN  = int(os.environ.get("MAX_FULL_ALERTS_PER_SCAN",  5))
+MAX_WATCH_ALERTS_PER_SCAN = int(os.environ.get("MAX_WATCH_ALERTS_PER_SCAN", 5))
+
+# Per-ticker pacing inside the scan loop (seconds)
+SCAN_PER_TICKER_SLEEP = float(os.environ.get("SCAN_PER_TICKER_SLEEP", 1.0))
 
 # Heartbeat — how often the loop wakes to check which tier applies
 _HEARTBEAT_SECONDS = 60
@@ -151,9 +160,9 @@ def _check_row(label: str, passed: bool, detail: str = "") -> str:
 
 
 def _build_full_alert(result: AnalysisResult, regime_label: str) -> str:
-    a  = result.setup_a
+    a  = result.checks
     s  = result.stops
-    ma = ", ".join(a.triggered_mas) if a.triggered_mas else "—"
+    ma = ", ".join(result.triggered_mas) if result.triggered_mas else "—"
     vr = (f"{result.volume_current / result.volume_ma20:.1f}× avg"
           if result.volume_ma20 and result.volume_ma20 > 0 else "n/a")
 
@@ -196,8 +205,8 @@ def _build_full_alert(result: AnalysisResult, regime_label: str) -> str:
 
 
 def _build_watch_alert(result: AnalysisResult, regime_label: str) -> str:
-    a  = result.setup_a
-    ma = ", ".join(a.triggered_mas) if a.triggered_mas else "—"
+    a  = result.checks
+    ma = ", ".join(result.triggered_mas) if result.triggered_mas else "—"
     failing = [
         lbl for check, lbl in [
             (a.sma200_slope,    "SMA200 slope rising"),
@@ -332,13 +341,23 @@ async def _run_daily_check(bot: Bot, chat_id: str) -> None:
 # ── Tier 3: Universe / watchlist scan ─────────────────────────────────────────
 
 async def _run_ticker_scan(bot: Bot, chat_id: str) -> None:
-    """Run Setup A across the full universe or watchlist."""
+    """
+    Run Setup A across the full universe or watchlist.
+
+    Two-pass design (needed because universe mode can scan 1000+ tickers):
+      Pass 1 — score every ticker, update its persisted state, and bucket
+               cooldown-eligible candidates into "full signal" (8/8) and
+               "watching" (partial score) groups.
+      Pass 2 — rank each group (volume surge ratio, then MA confluence
+               count, both descending) and send alerts for only the
+               top MAX_FULL_ALERTS_PER_SCAN / MAX_WATCH_ALERTS_PER_SCAN.
+    """
     # Determine what to scan
     if UNIVERSE_MODE:
         from universe import load_candidates
         candidates = load_candidates()
         if not candidates:
-            logger.info("Universe mode: no candidates — run /refresh")
+            logger.info("Universe mode: no candidates — run /refreshuniverse")
             return
         watchlist = {t: {} for t in candidates}
     else:
@@ -354,26 +373,90 @@ async def _run_ticker_scan(bot: Bot, chat_id: str) -> None:
     logger.info("TIER 3 — Scanning %d ticker(s) | regime: %s",
                 len(watchlist), regime_label)
 
+    full_candidates: list[AnalysisResult] = []
+    watch_candidates: list[AnalysisResult] = []
+
+    # ── Pass 1: score every ticker ──────────────────────────────────────────
     for ticker, ticker_state in list(watchlist.items()):
-        await _process_ticker(bot, chat_id, watchlist, ticker,
-                              ticker_state, regime_label)
-        await asyncio.sleep(2)   # keep event loop responsive
+        result = await _scan_ticker(
+            watchlist, ticker, ticker_state,
+            full_candidates, watch_candidates,
+        )
+        if result is not None:
+            await asyncio.sleep(SCAN_PER_TICKER_SLEEP)  # keep event loop responsive
+
+    logger.info(
+        "Pass 1 complete — %d full-signal candidate(s), %d watching candidate(s)",
+        len(full_candidates), len(watch_candidates),
+    )
+
+    # ── Pass 2: rank and alert on the top N of each group ───────────────────
+    full_candidates.sort(key=_rank_key, reverse=True)
+    watch_candidates.sort(key=_rank_key, reverse=True)
+
+    top_full  = full_candidates[:MAX_FULL_ALERTS_PER_SCAN]
+    top_watch = watch_candidates[:MAX_WATCH_ALERTS_PER_SCAN]
+
+    for result in top_full:
+        await _send(bot, chat_id, _build_full_alert(result, regime_label))
+        wl_store.update_ticker_state(
+            watchlist, result.ticker,
+            last_alert_ts=result.timestamp.isoformat(),
+        )
+        logger.info(
+            "ALERT: %s  score=8/8  vol_ratio=%.2f  MA=%s",
+            result.ticker, result.volume_ratio or 0.0, result.triggered_mas,
+        )
+
+    for result in top_watch:
+        await _send(bot, chat_id, _build_watch_alert(result, regime_label))
+        logger.info(
+            "WATCHING: %s  score=%d/8  vol_ratio=%.2f",
+            result.ticker, result.checks.score, result.volume_ratio or 0.0,
+        )
+
+    if len(full_candidates) > MAX_FULL_ALERTS_PER_SCAN:
+        logger.info(
+            "%d additional 8/8 signal(s) suppressed by top-%d cap",
+            len(full_candidates) - MAX_FULL_ALERTS_PER_SCAN, MAX_FULL_ALERTS_PER_SCAN,
+        )
+    if len(watch_candidates) > MAX_WATCH_ALERTS_PER_SCAN:
+        logger.info(
+            "%d additional watching candidate(s) suppressed by top-%d cap",
+            len(watch_candidates) - MAX_WATCH_ALERTS_PER_SCAN, MAX_WATCH_ALERTS_PER_SCAN,
+        )
 
     logger.info("Scan complete")
 
 
-async def _process_ticker(
-    bot: Bot, chat_id: str, watchlist: dict,
-    ticker: str, state: dict, regime_label: str,
-) -> None:
+def _rank_key(result: AnalysisResult) -> tuple[float, int]:
+    """
+    Ranking key for breaking ties among same-score candidates.
+    Sorted descending: higher volume surge ratio first, then more
+    moving-average confluence (more MAs within proximity).
+    """
+    return (result.volume_ratio or 0.0, len(result.triggered_mas))
+
+
+async def _scan_ticker(
+    watchlist: dict,
+    ticker: str, state: dict,
+    full_candidates: list, watch_candidates: list,
+) -> Optional[AnalysisResult]:
+    """
+    Fetch + analyse one ticker, persist its latest state, and -- if it
+    qualifies and isn't on cooldown -- add it to the appropriate
+    candidate bucket for ranking in pass 2. Returns the result (or None
+    on a data-fetch error, so the caller can skip the pacing sleep).
+    """
     loop   = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, fetch_and_analyse, ticker)
 
     if result.error:
-        logger.warning("Skipping %s — %s", ticker, result.error)
-        return
+        logger.warning("Skipping %s -- %s", ticker, result.error)
+        return None
 
-    a = result.setup_a
+    a = result.checks
 
     wl_store.update_ticker_state(
         watchlist, ticker,
@@ -384,22 +467,20 @@ async def _process_ticker(
 
     cooldown_ok = _cooldown_expired(state.get("last_alert_ts"))
 
-    if a.signal and cooldown_ok:
-        await _send(bot, chat_id, _build_full_alert(result, regime_label))
-        wl_store.update_ticker_state(watchlist, ticker,
-                                     last_alert_ts=result.timestamp.isoformat())
-        logger.info("ALERT: %s  score=8/8  MA=%s", ticker, a.triggered_mas)
+    if a.all_pass and cooldown_ok:
+        full_candidates.append(result)
 
-    elif a.signal and not cooldown_ok:
+    elif a.all_pass and not cooldown_ok:
         logger.info("SUPPRESSED (cooldown): %s", ticker)
 
     elif (a.score >= PARTIAL_ALERT_MIN_SCORE
           and a.ma_proximity and a.uptrend and cooldown_ok):
-        await _send(bot, chat_id, _build_watch_alert(result, regime_label))
-        logger.info("WATCHING: %s  score=%d/8", ticker, a.score)
+        watch_candidates.append(result)
 
     else:
-        logger.debug("%s — no signal. score=%d/8", ticker, a.score)
+        logger.debug("%s -- no signal. score=%d/8", ticker, a.score)
+
+    return result
 
 
 async def _send(bot: Bot, chat_id: str, text: str) -> None:
@@ -408,3 +489,4 @@ async def _send(bot: Bot, chat_id: str, text: str) -> None:
                                parse_mode=ParseMode.MARKDOWN)
     except Exception as exc:
         logger.error("Telegram send failed: %s", exc)
+xc)

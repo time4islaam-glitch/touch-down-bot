@@ -125,6 +125,7 @@ class AnalysisResult:
     # Volume context
     volume_current: Optional[float] = None
     volume_ma20:    Optional[float] = None
+    volume_ratio:   Optional[float] = None  # volume_current / volume_ma20
 
     # Which MA(s) are within proximity threshold
     triggered_mas: list = field(default_factory=list)
@@ -237,6 +238,7 @@ def fetch_and_analyse(ticker: str) -> AnalysisResult:
         result.atr_14         = round(atr_14,   4)
         result.volume_current = round(vol_current, 0)
         result.volume_ma20    = round(vol_ma20,    0)
+        result.volume_ratio   = round(vol_current / vol_ma20, 4) if vol_ma20 > 0 else 0.0
 
         checks = SignalChecks()
 
