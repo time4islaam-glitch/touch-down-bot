@@ -57,6 +57,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• `/universe` — Show universe mode status & last regime state\n\n"
         "• `/refresh` — Manually trigger a regime re-check _(admin only)_\n\n"
         "• `/refreshuniverse` — Rescan exchanges & rebuild candidate list _(admin only)_\n\n"
+        "• `/scannow` — Force an immediate Tier 3 ticker scan _(admin only)_\n\n"
         "• `/help` — Show this message\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📊 *Alert Logic*\n"
@@ -510,4 +511,40 @@ async def cmd_refreshuniverse(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.exception("cmd_refreshuniverse error: %s", exc)
         await update.message.reply_text(
             f"\u274c Universe refresh failed: `{exc}`", parse_mode=ParseMode.MARKDOWN
+        )
+
+
+# ── /scannow ───────────────────────────────────────────────────────────────────
+
+async def cmd_scannow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /scannow — Manually trigger a Tier 3 ticker scan immediately.
+    Admin-only. Bypasses market-hours, day_active, and the SCAN_INTERVAL
+    cooldown entirely — runs the same two-pass scan/alert logic as the
+    regular intraday scanner, on demand.
+    """
+    from scanner import _run_ticker_scan
+
+    admin_id  = int(os.environ.get("ADMIN_USER_ID", "0"))
+    caller_id = update.effective_user.id if update.effective_user else 0
+
+    if admin_id == 0 or caller_id != admin_id:
+        await update.message.reply_text(
+            "⛔ /scannow is restricted to the bot administrator.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text(
+        "🔄 Running ticker scan now — this may take a while…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    try:
+        await _run_ticker_scan(context.bot, str(update.effective_chat.id))
+        logger.info("Manual scan complete via /scannow")
+    except Exception as exc:
+        logger.exception("cmd_scannow error: %s", exc)
+        await update.message.reply_text(
+            f"❌ Scan failed: `{exc}`", parse_mode=ParseMode.MARKDOWN
         )
