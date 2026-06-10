@@ -489,4 +489,3 @@ async def _send(bot: Bot, chat_id: str, text: str) -> None:
                                parse_mode=ParseMode.MARKDOWN)
     except Exception as exc:
         logger.error("Telegram send failed: %s", exc)
-xc)
